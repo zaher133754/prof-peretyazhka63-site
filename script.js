@@ -1,9 +1,10 @@
 document.documentElement.classList.add("js");
 
-const TELEGRAM_USERNAME = "sagatel_petrosyan";
-const BASE_MESSAGE = "Здравствуйте! Хочу рассчитать стоимость перетяжки мебели.";
 const MAX_PHOTO_SIZE = 10 * 1024 * 1024;
 const MAX_PHOTO_COUNT = 5;
+const MAX_TOTAL_UPLOAD_SIZE = 18 * 1024 * 1024;
+const PHOTO_OPTIMIZE_THRESHOLD = 2.5 * 1024 * 1024;
+const MAX_PHOTO_DIMENSION = 1800;
 const ALLOWED_PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 const menuToggle = document.querySelector(".menu-toggle");
@@ -44,6 +45,38 @@ document.querySelectorAll('a[href^="#"]').forEach((link) => {
   });
 });
 
+const filterButtons = document.querySelectorAll(".filter-button");
+const portfolioItems = [...document.querySelectorAll(".portfolio-item")];
+const portfolioToggle = document.querySelector(".portfolio-toggle");
+let activePortfolioFilter = "all";
+let portfolioExpanded = false;
+
+function updatePortfolio() {
+  const matchingItems = portfolioItems.filter(
+    (item) => activePortfolioFilter === "all" || item.dataset.category === activePortfolioFilter
+  );
+
+  portfolioItems.forEach((item) => {
+    const matchingIndex = matchingItems.indexOf(item);
+    const matchesFilter = matchingIndex !== -1;
+    item.hidden = !matchesFilter || (!portfolioExpanded && matchingIndex >= 9);
+  });
+
+  if (!portfolioToggle) return;
+  portfolioToggle.hidden = matchingItems.length <= 9;
+  portfolioToggle.setAttribute("aria-expanded", String(portfolioExpanded));
+  portfolioToggle.querySelector("span").textContent = portfolioExpanded ? "Свернуть" : "Показать все работы";
+}
+
+if (portfolioToggle) {
+  portfolioToggle.addEventListener("click", () => {
+    portfolioExpanded = !portfolioExpanded;
+    updatePortfolio();
+  });
+}
+
+updatePortfolio();
+
 const revealItems = document.querySelectorAll(".reveal");
 if ("IntersectionObserver" in window) {
   const revealObserver = new IntersectionObserver(
@@ -61,21 +94,17 @@ if ("IntersectionObserver" in window) {
   revealItems.forEach((item) => item.classList.add("is-visible"));
 }
 
-const filterButtons = document.querySelectorAll(".filter-button");
-const portfolioItems = document.querySelectorAll(".portfolio-item");
-
 filterButtons.forEach((button) => {
   button.setAttribute("aria-pressed", button.classList.contains("active") ? "true" : "false");
   button.addEventListener("click", () => {
-    const filter = button.dataset.filter;
+    activePortfolioFilter = button.dataset.filter;
+    portfolioExpanded = false;
     filterButtons.forEach((item) => {
       const active = item === button;
       item.classList.toggle("active", active);
       item.setAttribute("aria-pressed", String(active));
     });
-    portfolioItems.forEach((item) => {
-      item.hidden = filter !== "all" && item.dataset.category !== filter;
-    });
+    updatePortfolio();
   });
 });
 
@@ -132,6 +161,8 @@ if (form) {
   const photoInput = form.elements.photos;
   const photoPreview = form.querySelector(".photo-preview");
   const formStatus = form.querySelector(".form-status");
+  const submitButton = form.querySelector('button[type="submit"]');
+  const submitButtonLabel = submitButton.querySelector("span");
   let previewUrls = [];
 
   phoneInput.addEventListener("input", () => {
@@ -171,9 +202,9 @@ if (form) {
     });
   });
 
-  form.addEventListener("submit", (event) => {
+  form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    formStatus.textContent = "";
+    setFormStatus(formStatus, "", "");
 
     const name = form.elements.name;
     const furniture = form.elements.furniture;
@@ -207,23 +238,52 @@ if (form) {
 
     if (!valid) {
       form.querySelector(".invalid")?.focus();
-      formStatus.textContent = "Проверьте отмеченные поля.";
-      formStatus.style.color = "var(--danger)";
+      setFormStatus(formStatus, "error", "Проверьте отмеченные поля.");
       return;
     }
 
-    const comment = form.elements.comment.value.trim();
-    const message = [
-      BASE_MESSAGE,
-      "",
-      `Имя: ${name.value.trim()}`,
-      `Телефон: ${phoneInput.value}`,
-      `Мебель: ${furniture.value}`,
-      `Фото: ${photos.length} ${photoCountLabel(photos.length)}`,
-      comment ? `Комментарий: ${comment}` : ""
-    ].filter(Boolean).join("\n");
+    submitButton.disabled = true;
+    submitButton.setAttribute("aria-busy", "true");
+    submitButtonLabel.textContent = "Отправляем…";
+    setFormStatus(formStatus, "", "Подготавливаем фотографии…");
 
-    openTelegramRequest(message, photos, formStatus);
+    try {
+      const preparedPhotos = await preparePhotosForUpload(photos);
+      const totalSize = preparedPhotos.reduce((sum, photo) => sum + photo.size, 0);
+
+      if (totalSize > MAX_TOTAL_UPLOAD_SIZE) {
+        throw new FormSubmissionError("Общий размер фотографий слишком большой. Уберите одно фото и попробуйте снова.");
+      }
+
+      const formData = new FormData(form);
+      formData.delete("photos");
+      preparedPhotos.forEach((photo) => formData.append("photos", photo, photo.name));
+      setFormStatus(formStatus, "", "Отправляем заявку…");
+
+      const response = await fetch("/api/photo-request", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        body: formData
+      });
+      const result = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new FormSubmissionError(result.message || "Не удалось отправить заявку. Попробуйте ещё раз.");
+      }
+
+      form.reset();
+      clearPhotoPreviews();
+      setFormStatus(formStatus, "success", result.message || "Заявка отправлена. Мы скоро свяжемся с вами.");
+    } catch (error) {
+      const message = error instanceof FormSubmissionError
+        ? error.message
+        : "Не удалось связаться с сервером. Проверьте интернет и попробуйте ещё раз.";
+      setFormStatus(formStatus, "error", message);
+    } finally {
+      submitButton.disabled = false;
+      submitButton.removeAttribute("aria-busy");
+      submitButtonLabel.textContent = "Отправить заявку";
+    }
   });
 
   function clearPhotoPreviews() {
@@ -241,35 +301,84 @@ function validatePhotos(files) {
   return "";
 }
 
-function photoCountLabel(count) {
-  if (count === 1) return "фотография";
-  if (count >= 2 && count <= 4) return "фотографии";
-  return "фотографий";
+class FormSubmissionError extends Error {}
+
+function setFormStatus(statusElement, type, message) {
+  statusElement.classList.toggle("is-error", type === "error");
+  statusElement.classList.toggle("is-success", type === "success");
+  statusElement.textContent = message;
 }
 
-async function openTelegramRequest(message, photos, formStatus) {
-  formStatus.style.color = "var(--moss)";
+async function preparePhotosForUpload(photos) {
+  const preparedPhotos = [];
+  for (const photo of photos) {
+    preparedPhotos.push(await optimizePhoto(photo));
+  }
+  return preparedPhotos;
+}
 
-  if (navigator.share && navigator.canShare?.({ files: photos })) {
-    formStatus.textContent = `Выберите Telegram и чат @${TELEGRAM_USERNAME}.`;
-    try {
-      await navigator.share({
-        title: "Заявка на расчёт перетяжки мебели",
-        text: `${message}\n\nПолучатель: @${TELEGRAM_USERNAME}`,
-        files: photos
-      });
-      formStatus.textContent = "Фото и текст переданы в Telegram. Проверьте чат и отправьте сообщение.";
-      return;
-    } catch (error) {
-      if (error.name === "AbortError") {
-        formStatus.textContent = "Отправка отменена. Форма и выбранные фото сохранены.";
-        return;
-      }
-    }
+async function optimizePhoto(photo) {
+  if (photo.size <= PHOTO_OPTIMIZE_THRESHOLD) return photo;
+
+  let decodedPhoto;
+  try {
+    decodedPhoto = await decodePhoto(photo);
+    const scale = Math.min(1, MAX_PHOTO_DIMENSION / Math.max(decodedPhoto.width, decodedPhoto.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(decodedPhoto.width * scale));
+    canvas.height = Math.max(1, Math.round(decodedPhoto.height * scale));
+
+    const context = canvas.getContext("2d");
+    if (!context) return photo;
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(decodedPhoto.source, 0, 0, canvas.width, canvas.height);
+
+    const optimizedBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
+    if (!optimizedBlob || optimizedBlob.size >= photo.size) return photo;
+
+    const optimizedName = photo.name.replace(/\.[^.]+$/, "") + ".jpg";
+    return new File([optimizedBlob], optimizedName, {
+      type: "image/jpeg",
+      lastModified: photo.lastModified
+    });
+  } catch {
+    return photo;
+  } finally {
+    decodedPhoto?.release();
+  }
+}
+
+async function decodePhoto(photo) {
+  if ("createImageBitmap" in window) {
+    const bitmap = await createImageBitmap(photo, { imageOrientation: "from-image" });
+    return {
+      source: bitmap,
+      width: bitmap.width,
+      height: bitmap.height,
+      release: () => bitmap.close()
+    };
   }
 
-  formStatus.textContent = "Открываем чат в Telegram. Добавьте выбранные фото кнопкой-скрепкой и отправьте сообщение.";
-  window.open(`https://t.me/${TELEGRAM_USERNAME}?text=${encodeURIComponent(message)}`, "_blank", "noopener");
+  const objectUrl = URL.createObjectURL(photo);
+  const image = new Image();
+  image.decoding = "async";
+  image.src = objectUrl;
+  try {
+    await image.decode();
+    return {
+      source: image,
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+      release: () => URL.revokeObjectURL(objectUrl)
+    };
+  } catch (error) {
+    URL.revokeObjectURL(objectUrl);
+    throw error;
+  }
 }
 
 function getErrorElement(field) {
